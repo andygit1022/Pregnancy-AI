@@ -16,6 +16,9 @@ from xgboost.callback import EarlyStopping
 
 import lightgbm as lgb
 
+
+from imblearn.combine import SMOTEENN
+from imblearn.over_sampling import SMOTE
 #################
 # CatBoost
 #################
@@ -26,6 +29,11 @@ from catboost import CatBoostClassifier
 #########################
 from sklearn.linear_model import LogisticRegression
 
+
+
+
+
+
 #########################
 # Metrics
 #########################
@@ -34,7 +42,7 @@ from sklearn.metrics import roc_auc_score, accuracy_score, precision_score
 from .PARAMS import (
     EPOCHS, BATCH_SIZE, SAVE_EPOCH,
     MLP_LEARNING_RATE, MLP_OPTIMIZER, MLP_HIDDEN_UNITS, MLP_DROPOUT,
-    XGB_PARAMS, LGB_PARAMS,
+    XGB_PARAMS_IVF, XGB_PARAMS_DI,
     SEED, XGB_EVAL_METRIC
 )
 
@@ -43,65 +51,76 @@ from .PARAMS import (
 # 1) XGBoost 모델
 #######################################
 class XGBoostModel:
-    def __init__(self):
+    def __init__(self, use_smote=False, ivf_di="ivf"):
         """
-        XGB_PARAMS는 PARAMS.py에서 예시로:
-        XGB_PARAMS = {
-            "n_estimators": 1000,
-            "learning_rate": 0.1,
-            "max_depth": 6,
-            "random_state": 42,
-            "eval_metric": "auc",
-        }
-        형태로 설정해둔다고 가정.
+        use_smoteenn : True로 설정하면 fit()할 때 SMOTE+ENN 적용.
         """
-        self.model = xgb.XGBClassifier(
-            **XGB_PARAMS,
-            eval_metric=XGB_EVAL_METRIC
-        )
+        self.use_smote = use_smote
+
+        # XGBoostClassifier 설정
+        if ivf_di == "ivf":
+            self.model = xgb.XGBClassifier(
+                **XGB_PARAMS_IVF,
+                eval_metric=XGB_EVAL_METRIC
+            )
+        else :
+            self.model = xgb.XGBClassifier(
+                **XGB_PARAMS_DI,
+                eval_metric=XGB_EVAL_METRIC
+            )
+               
+            
         self.best_score = 0.0
         self.best_iteration = 0
         self.best_model = None
 
     def fit(self, X_train, y_train, X_val, y_val):
-        # XGBoost는 fit 한 번으로 자동 학습+early stopping 지원
-        # iteration마다의 AUC 기록을 얻으려면 evals_result를 사용
-        eval_set = [(X_train, y_train), (X_val, y_val)]
+        """
+        XGBoost 모델 학습 및 Best 모델 저장 (Validation AUC 기준)
+        """
+        # ---------------------------
+        # (1) SMOTE+ENN 적용 (선택)
+        # ---------------------------
+        # if self.use_smoteenn:
+        #     from imblearn.combine import SMOTEENN
+        #     sm = SMOTEENN(random_state=SEED)
+        #     X_train, y_train = sm.fit_resample(X_train, y_train)
+        #     print(f"[XGBoost] After SMOTEENN: X_train={X_train.shape}, y_train={y_train.shape}")
+
+        if self.use_smote:
+            print("[XGBoost] Applying SMOTE...")
+            sm = SMOTE(sampling_strategy='auto',k_neighbors=5,random_state=SEED)  # SMOTE 적용
+            X_train, y_train = sm.fit_resample(X_train, y_train)
+            print(f"[XGBoost] After SMOTE: X_train={X_train.shape}, y_train={y_train.shape}")
+
+        # ---------------------------
+        # (2) 모델 학습 (Verbose=100)
+        # ---------------------------
         
-        early_stopping = EarlyStopping(
-            rounds=10, 
-            metric_name="auc", 
-            data_name="validation_1",
-            save_best=True
-        )
+        
         
         self.model.fit(
             X_train, y_train,
-            eval_set=eval_set,
-            #num_boost_round=XGB_PARAMS["n_estimators"],
-            #early_stopping_rounds = 10,
-            #callbacks=[early_stopping],  #  early_stopping을 callbacks로 전달
-            verbose=True
+            eval_set=[(X_train, y_train), (X_val, y_val)],
+            #early_stopping_rounds=10,  # Validation loss가 10번 동안 개선되지 않으면 종료
+            verbose=100  # 매 100 라운드마다 AUC 로그 출력
         )
-        
-        
-        
-        # ✅ best_iteration 가져오기
-        if hasattr(self.model, "best_ntree_limit"):
-            self.best_iteration = self.model.best_ntree_limit
-        else:
-            self.best_iteration = self.model.n_estimators  # 기본값
 
+        # ---------------------------
+        # (3) Best Iteration 선택
+        # ---------------------------
         results = self.model.evals_result()
-        train_auc = results['validation_0']['auc']
-        val_auc = results['validation_1']['auc']
+        val_auc_list = results["validation_1"]["auc"]  # Validation AUC 리스트
 
-        print(f"Final Train AUC: {train_auc[-1]:.4f}, Validation AUC: {val_auc[-1]:.4f}")
-        
-        
-        self.best_score = results['validation_1']['auc'][-1]  # 마지막 AUC 값 저장
+        # ✅ 최고 AUC를 기록한 index 찾기
+        self.best_iteration = np.argmax(val_auc_list) + 1  # (index는 0부터 시작하므로 +1)
 
-        # ✅ best_model 저장
+        # ✅ best_iteration 기반 모델 설정
+        self.model.set_params(n_estimators=self.best_iteration)
+        print(f"\n✅ [XGBoost] Best Iteration: {self.best_iteration}, Best Validation AUC: {max(val_auc_list):.4f}")
+
+        # ✅ Best Score 저장
+        self.best_score = max(val_auc_list)
         self.best_model = self.model.get_booster()
 
     def predict(self, X):
@@ -114,49 +133,100 @@ class XGBoostModel:
 #######################################
 # 2) LightGBM 모델
 #######################################
+import lightgbm as lgb
+from imblearn.over_sampling import SMOTE
+import numpy as np
+
+from sklearn.metrics import roc_auc_score
+from collections import Counter
+from .PARAMS import LGB_PARAMS_DI, LGB_PARAMS_IVF
+import logging
+
+
 class LightGBMModel:
-    def __init__(self):
+    def __init__(self, use_smote=False, eval_metric="auc", ivf_di = "ivf", random_state=42):
         """
-        LGB_PARAMS = {
-            "n_estimators": 1000,
-            "learning_rate": 0.1,
-            "max_depth": -1,
-            "random_state": 42
-        }
+        use_smote : True 설정 시 fit()에서 SMOTE 오버샘플링 적용
+        lgb_params: LightGBM 모델 파라미터(dict)
+        eval_metric: 평가 지표 (e.g. 'auc', 'binary_logloss' 등)
+        random_state: 난수 고정
         """
-        self.model = lgb.LGBMClassifier(**LGB_PARAMS)
-        self.best_score = 0.0
+        self.use_smote = use_smote
+        self.eval_metric = eval_metric
+        
+        if isinstance(eval_metric, str):
+            self.eval_metric = [eval_metric]  # 단일 문자열이면 리스트로 변환
+        else:
+            self.eval_metric = eval_metric
+        
+        if ivf_di == "ivf":    
+            self.model = lgb.LGBMClassifier(**LGB_PARAMS_IVF)
+        else :
+            self.model = lgb.LGBMClassifier(**LGB_PARAMS_DI)
+
         self.best_iteration = 0
+        self.best_score = 0.0
         self.best_model = None
+        
+        logging.getLogger("lightgbm").setLevel(logging.CRITICAL)
 
     def fit(self, X_train, y_train, X_val, y_val):
+        """
+        LightGBM 모델을 학습하고 best_iteration, best_score를 기록.
+        """
+        # 1) SMOTE 적용(선택)
+        if self.use_smote:
+            print("[LightGBM] Applying SMOTE...")
+            sm = SMOTE(random_state=42, sampling_strategy="auto")
+            X_train, y_train = sm.fit_resample(X_train, y_train)
+            print(f"[LightGBM] After SMOTE: X_train={X_train.shape}, y_train={Counter(y_train)}")
+
+        # 2) 모델 학습
+        #   - early_stopping_rounds: eval_metric 개선이 10번 정체되면 학습 중단
+        #   - verbose: 100마다 로그
+        
+        cbs = [
+            lgb.log_evaluation(period=100)  # 100 iteration마다 결과 로그
+        ]
+        
         self.model.fit(
             X_train, y_train,
             eval_set=[(X_val, y_val)],
-            eval_metric='auc',
-            early_stopping_rounds=10,
-            verbose=False
-        )
-        # LightGBM은 fit 후 model.best_iteration_ / model.best_score_ 존재
-        self.best_iteration = self.model.best_iteration_
-        # best_score_는 딕셔너리 형태
-        # 예: {'training': {'auc': ...}, 'valid_1': {'auc': ...}}
-        if hasattr(self.model, 'best_score_'):
-            # valid_0 or valid_1 키 이름이 LightGBM 버전에 따라 다를 수 있음
-            # 여기서는 valid_0일 수도 있고 valid_1일 수도 있음. 확인 필요
-            best_dict = self.model.best_score_.get('valid_0', {})
-            self.best_score = best_dict.get('auc', 0.0)
+            eval_names=["valid"],
+            eval_metric=self.eval_metric,
+            # sample_weight=None, init_score=None,
+            # eval_sample_weight=None, eval_class_weight=None,
+            # feature_name="auto", categorical_feature="auto",
+            callbacks=cbs, init_model=None,
 
-        # 필요한 경우, best_iteration까지의 모델 가중치를 별도로 저장
-        # LightGBM은 내부적으로 best_iteration_ 사용하면 predict 시 자동으로 best만큼 사용
-        # 별도 copy는 아래처럼 joblib 등으로 가능
-        self.best_model = self.model  # 간단히 할당
+        )
+
+        # (3) 별도 early_stopping이 없으므로,
+        #     직접 검증 세트 AUC를 구해 best_score 기록
+
+        y_val_proba = self.model.predict_proba(X_val)[:, 1]
+        auc_val = roc_auc_score(y_val, y_val_proba)
+        self.best_score = auc_val
+
+        # best_iteration_은 early_stopping 콜백을 쓰지 않으면 업데이트 안 될 수 있음
+        self.best_iteration = self.model.best_iteration_
+        # 그냥 참조용 -> 보통 0일 것
+        self.best_model = self.model
+
+        print(f"\n✅ [LightGBM] Final Model n_estimators={self.model.n_estimators_}, Validation {self.eval_metric}={self.best_score:.4f}")
+
 
     def predict(self, X):
-        return self.model.predict(X, num_iteration=self.best_iteration)
+        """
+        LightGBM 이진 분류에서 라벨(0/1) 예측
+        """
+        return self.model.predict(X)
 
     def predict_proba(self, X):
-        return self.model.predict_proba(X, num_iteration=self.best_iteration)[:, 1]
+        """
+        LightGBM 이진 분류에서 양성 클래스 확률 예측
+        """
+        return self.model.predict_proba(X)[:, 1]
 
 
 #######################################

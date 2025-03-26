@@ -6,7 +6,7 @@ import re
 
 from .PARAMS import (
     TRAIN_PATH, TEST_PATH, TARGET_COL, 
-    FULL_FEATURES, FEATURES
+    FULL_FEATURES, FEATURES_FOR_DI, FEATURES_FOR_IVF, FEATURES
 )
 
 #####################
@@ -23,8 +23,8 @@ def load_data(csv_path):
 # 1) 슬래시('/') 개수, 2) 콜론(':') 개수,
 # 3) 특정 토큰들 각각의 등장 횟수
 SPECIAL_TOKENS = [
-    "ICSI", "IVF", "IUI", "IVI", "ICI","Generic DI"
-    "GIFT", "AH", "BLASTOCYST", "Unknown"
+    "ICSI", "IVF", "IUI", "IVI", "ICI","Generic DI",
+    "GIFT", "AH", "BLASTOCYST", "Unknown","FER"
 ]
 
 def parse_special_treatment_counts(treatment_str):
@@ -73,17 +73,35 @@ def parse_special_treatment_counts(treatment_str):
 ###########################
 # 2) 실제 전처리 핵심 함수
 ###########################
-def preprocess_data(df, is_train=True):
+def preprocess_data(df, is_train=True, procedure_type=None):
     # 사용할 컬럼만 추출
-    use_cols = [col for col in FEATURES if col in FULL_FEATURES]
-    if TARGET_COL in df.columns:
-        use_cols += [TARGET_COL]
+    
+    # (A) 시술 유형 필터링
+    if procedure_type in ["IVF", "DI", "ALL"]:
+        if procedure_type in ["IVF", "DI"]:
+            df = df[df["시술 유형"] == procedure_type].copy()
+            print(f"[preprocess_data] procedure_type={procedure_type}, shape={df.shape}")
+        else:
+            print(f"[preprocess_data] procedure_type={procedure_type}, shape={df.shape}")
+    
+    if(procedure_type == "IVF"):
+        use_cols = [col for col in FEATURES_FOR_IVF if col in FULL_FEATURES]
+        if TARGET_COL in df.columns:
+            use_cols += [TARGET_COL]            
+    elif(procedure_type == "DI"):
+        use_cols = [col for col in FEATURES_FOR_DI if col in FULL_FEATURES]
+        if TARGET_COL in df.columns:
+            use_cols += [TARGET_COL]       
+    else :
+        use_cols = [col for col in FEATURES if col in FULL_FEATURES]
+        if TARGET_COL in df.columns:
+            use_cols += [TARGET_COL] 
 
     df = df[use_cols].copy()
     out_df = pd.DataFrame(index=df.index)
 
     for col in df.columns:
-        print(col)
+        #print(col)
         if col == TARGET_COL:
             continue
 
@@ -103,7 +121,7 @@ def preprocess_data(df, is_train=True):
             out_df[col] = bin_col
 
         elif process_type == "OHE":
-            dummies = pd.get_dummies(series, prefix=col)
+            dummies = pd.get_dummies(series, prefix=col,dtype=int).astype(int)
             out_df = pd.concat([out_df, dummies], axis=1)
 
         elif process_type == "SPECIAL":
@@ -138,6 +156,8 @@ def preprocess_data(df, is_train=True):
     if TARGET_COL in df.columns:
         y = df[TARGET_COL].copy()
         y = pd.to_numeric(y, errors="coerce").fillna(0).astype(int)
+    
+    out_df.to_csv(f"output_{procedure_type}.csv", index=True)
 
     return out_df, y
 
@@ -157,7 +177,7 @@ def apply_missing_strategy(series, process_type, na_strategy):
     elif na_strategy == "none":
         return series.fillna("Unknown")
     elif na_strategy == "special_fill_3":
-        return series.fillna(4)
+        return series.fillna(3)
     else:
         return series
 
